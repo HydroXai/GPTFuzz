@@ -100,13 +100,6 @@ class GPTFuzzer:
         self.max_iteration: int = max_iteration
 
         self.energy: int = energy
-        if result_file is None:
-            result_file = f'results-{time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())}.csv'
-
-        self.raw_fp = open(result_file, 'w', buffering=1)
-        self.writter = csv.writer(self.raw_fp)
-        self.writter.writerow(
-            ['index', 'prompt', 'response', 'parent', 'results'])
 
         self.generate_in_batch = False
         if len(self.questions) > 0 and generate_in_batch is True:
@@ -143,7 +136,8 @@ class GPTFuzzer:
             logging.info("Fuzzing interrupted by user!")
 
         logging.info("Fuzzing finished!")
-        self.raw_fp.close()
+
+        return self.adv_prompts[-1], self.adv_responses[-1]
 
     def evaluate(self, prompt_nodes: 'list[PromptNode]'):
         for prompt_node in prompt_nodes:
@@ -166,6 +160,8 @@ class GPTFuzzer:
                     responses = self.target.generate_batch(messages)
                 prompt_node.response = responses
                 prompt_node.results = self.predictor.predict(responses)
+        self.adv_prompts = messages
+        self.adv_responses = responses
 
     def update(self, prompt_nodes: 'list[PromptNode]'):
         self.current_iteration += 1
@@ -174,8 +170,6 @@ class GPTFuzzer:
             if prompt_node.num_jailbreak > 0:
                 prompt_node.index = len(self.prompt_nodes)
                 self.prompt_nodes.append(prompt_node)
-                self.writter.writerow([prompt_node.index, prompt_node.prompt,
-                                       prompt_node.response, prompt_node.parent.index, prompt_node.results])
 
             self.current_jailbreak += prompt_node.num_jailbreak
             self.current_query += prompt_node.num_query

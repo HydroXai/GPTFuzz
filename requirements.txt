@@ -1,0 +1,9 @@
+fschat==0.2.32
+anthropic
+google-generativeai
+openai
+openpyxl
+termcolor
+torch
+torchvision
+vllm
