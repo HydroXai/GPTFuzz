@@ -6,4 +6,3 @@ openpyxl
 termcolor
 torch
 torchvision
-vllm
