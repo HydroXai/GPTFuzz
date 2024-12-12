@@ -6,3 +6,5 @@ openpyxl
 termcolor
 torch
 torchvision
+fire
+pandas
