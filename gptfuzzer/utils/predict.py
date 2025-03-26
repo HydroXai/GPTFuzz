@@ -17,6 +17,8 @@ class RoBERTaPredictor(Predictor):
         self.model = RobertaForSequenceClassification.from_pretrained(
             self.path).to(self.device)
         self.tokenizer = RobertaTokenizer.from_pretrained(self.path)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def predict(self, sequences):
         inputs = self.tokenizer(sequences, padding=True, truncation=True,

@@ -1,46 +1,42 @@
 # git+https://github.com/HydroXai/GPTFuzz.git <- add to requirements
 
-import time
-import json
-import os
-import argparse
-import random
-from collections import namedtuple
-
 import fire
+import json
 import pandas as pd
-
-# Local application/library specific imports
-from gptfuzzer.llm import OpenAILLM, LocalVLLM, LocalLLM
-from gptfuzzer.utils.predict import RoBERTaPredictor
-from gptfuzzer.fuzzer.selection import MCTSExploreSelectPolicy
-from gptfuzzer.fuzzer.mutator import (
-    MutateRandomSinglePolicy, OpenAIMutatorCrossOver, OpenAIMutatorExpand,
-    OpenAIMutatorGenerateSimilar, OpenAIMutatorRephrase, OpenAIMutatorShorten)
-from gptfuzzer.fuzzer import GPTFuzzer
-
-
+import traceback
 import warnings
-# Suppress all warnings
+
+from collections import namedtuple
+from gptfuzzer.fuzzer import GPTFuzzer
+from gptfuzzer.fuzzer.mutator import (
+    MutateRandomSinglePolicy,
+    OpenAIMutatorCrossOver,
+    OpenAIMutatorExpand,
+    OpenAIMutatorGenerateSimilar,
+    OpenAIMutatorRephrase,
+    OpenAIMutatorShorten
+)
+from gptfuzzer.fuzzer.selection import MCTSExploreSelectPolicy
+from gptfuzzer.llm import LLM, LocalLLM
+from gptfuzzer.utils.predict import RoBERTaPredictor
+
+
 warnings.filterwarnings('ignore')
-# Suppress warnings from a specific library
 warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
 
 
-Result = namedtuple('Result', 'prompt targetModel error', defaults=(None, None, None))
+MAX_RETRY_COUNT = 2
+MAX_QUERY = 50
 
 
-def load_model(target_model_path: str, judge_model_path: str, openai_model_path: str = 'gpt-4o-mini-2024-07-18'):
-    openai_model = OpenAILLM(openai_model_path, os.getenv('OPENAI_API_KEY'))             
-    target_vllm_model = LocalVLLM(target_model_path, gpu_memory_utilization=0.9)
-    roberta_model = RoBERTaPredictor(judge_model_path, device='cuda')
-    return openai_model, target_vllm_model, roberta_model
+Result = namedtuple('Result', 'response error', defaults=(None, None))
 
 
 def run_gptfuzzer(
     seed_path: str,
-    target_model: str,
-    judge_model: str,
+    openai_model: LLM,
+    target_model: LLM,
+    judge_model: RoBERTaPredictor,
     goal_prompt: str,
     max_query: int = 500,
     max_jailbreak: int = 1,
@@ -48,12 +44,11 @@ def run_gptfuzzer(
 ):
 
     initial_seed = pd.read_csv(seed_path)['text'].tolist()
-    openai_model, target_vllm_model, roberta_model = load_model(target_model, judge_model)
 
     fuzzer = GPTFuzzer(
         questions=[goal_prompt],
-        target=target_vllm_model,
-        predictor=roberta_model,
+        target=target_model,
+        predictor=judge_model,
         initial_seed=initial_seed,
         mutate_policy=MutateRandomSinglePolicy([
             OpenAIMutatorCrossOver(openai_model, temperature=0.0),
@@ -74,20 +69,35 @@ def run_gptfuzzer(
     return adv_prompt
 
 
-def run(seed_path: str, target_model: str, judge_model: str, goal_prompt: str, result_path: str, max_query: int = 20):
-    try:
-        adv_prompt = run_gptfuzzer(seed_path, target_model, judge_model, goal_prompt, max_query)
-        target_model_name = os.path.basename(target_model)
-        result = [Result(prompt=adv_prompt,
-                        targetModel=target_model_name
-                        )._asdict()]
-    except Exception as e:
-        result = [Result(prompt=goal_prompt,
-                        error=f"An error was detected during the GPTFuzzer attack: {e}")._asdict()]
-    with open(result_path, 'w', encoding="utf8") as f:
-        json.dump(result, f)
+def main(input_path: str, output_path: str) -> None:
+    results = []
+    with open(input_path, mode='r') as f:
+        samples = json.load(f)
+        seed_path = samples.get("seedPath")
+        open_ai_replacement_model_path = samples.get("openAiReplacementModelPath")
+        target_model_path = samples.get("targetModelPath")
+        judge_model_path = samples.get("judgeModelPath")
+
+        open_ai_model = LocalLLM(open_ai_replacement_model_path)
+        target_model = LocalLLM(target_model_path)
+        judge_model = RoBERTaPredictor(judge_model_path)
+
+        for goal_prompt in samples.get("goalPrompts"):
+            count = 0
+            while count < MAX_RETRY_COUNT:
+                try:
+                    adv_prompt = run_gptfuzzer(seed_path, open_ai_model, target_model, judge_model, goal_prompt, MAX_QUERY)
+                    results.append(Result(response=adv_prompt)._asdict())
+                    break
+                except Exception as e:
+                    print(traceback.format_exc())
+
+                    if count == MAX_RETRY_COUNT - 1:
+                        results = [Result(error=f"An error was detected during the AutoDAN attack: {e}")._asdict()]
+                    count += 1
+    with open(output_path, 'w', encoding="utf8") as f:
+        json.dump(results, f)
 
 
 if __name__ == '__main__':
-    fire.Fire(run)
-    
+    fire.Fire(main)

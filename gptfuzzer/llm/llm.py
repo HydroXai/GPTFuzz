@@ -1,13 +1,23 @@
-import torch
-from openai import OpenAI
-from fastchat.model import load_model, get_conversation_template
+import concurrent.futures
+import google.generativeai as palm
 import logging
 import time
-import concurrent.futures
+import torch
+
+from accelerate import Accelerator
+from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
+from fastchat.model import load_model, get_conversation_template
+from openai import OpenAI
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizerFast
 from vllm import LLM as vllm
 from vllm import SamplingParams
-import google.generativeai as palm
-from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
+
+
+accelerator = Accelerator()
+quantization_config = BitsAndBytesConfig(
+    load_in_8Bit=True,
+    bnb_8bit_compute_dtype=torch.bfloat16
+)
 
 
 class LLM:
@@ -23,129 +33,76 @@ class LLM:
 
 
 class LocalLLM(LLM):
-    def __init__(self,
-                 model_path,
-                 device='cuda',
-                 num_gpus=1,
-                 max_gpu_memory=None,
-                 dtype=torch.float16,
-                 load_8bit=False,
-                 cpu_offloading=False,
-                 revision=None,
-                 debug=False,
-                 system_message=None
-                 ):
+    def __init__(self, model_path) -> None:
         super().__init__()
-
-        self.model, self.tokenizer = self.create_model(
-            model_path,
-            device,
-            num_gpus,
-            max_gpu_memory,
-            dtype,
-            load_8bit,
-            cpu_offloading,
-            revision=revision,
-            debug=debug,
-        )
-        self.model_path = model_path
-
-        if system_message is None and 'Llama-2' in model_path:
-            # monkey patch for latest FastChat to use llama2's official system message
-            self.system_message = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. " \
-            "Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. " \
-            "Please ensure that your responses are socially unbiased and positive in nature.\n\n" \
-            "If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. " \
-            "If you don't know the answer to a question, please don't share false information."
-        else:
-            self.system_message = system_message
-
-    @torch.inference_mode()
-    def create_model(self, model_path,
-                     device='cuda',
-                     num_gpus=1,
-                     max_gpu_memory=None,
-                     dtype=torch.float16,
-                     load_8bit=False,
-                     cpu_offloading=False,
-                     revision=None,
-                     debug=False):
-        model, tokenizer = load_model(
-            model_path,
-            device,
-            num_gpus,
-            max_gpu_memory,
-            dtype,
-            load_8bit,
-            cpu_offloading,
-            revision=revision,
-            debug=debug,
-        )
-
-        return model, tokenizer
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=quantization_config, device_map="auto")
+        self.tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(model_path)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.system_message = None
 
     def set_system_message(self, conv_temp):
         if self.system_message is not None:
             conv_temp.set_system_message(self.system_message)
 
-    @torch.inference_mode()
-    def generate(self, prompt, temperature=0.01, max_tokens=512, repetition_penalty=1.0):
-        conv_temp = get_conversation_template(self.model_path)
-        self.set_system_message(conv_temp)
+    def generate(self, prompt, temperature=0, max_tokens=512, n=1, max_trials=10, failure_sleep_time=5):
+        messages = []
+        if self.system_message is not None:
+            messages.append({"role": "system", "content": self.system_message})
+        messages.append({"role": "user", "content": prompt})
+        input_ids = self.tokenizer.apply_chat_template(messages,
+                                                    add_generation_prompt=True,
+                                                    return_tensors="pt").to(self.model.device)
+        generated_ids = self.model.generate(input_ids,
+                                        max_new_tokens=512,
+                                        do_sample=True,
+                                        pad_token_id=self.tokenizer.pad_token_id,
+                                        temperature=0.8)
+        outputs = generated_ids[0][input_ids.shape[-1]:]
+        response = self.tokenizer.decode(outputs, skip_special_tokens=True)
+        return [response]
 
-        conv_temp.append_message(conv_temp.roles[0], prompt)
-        conv_temp.append_message(conv_temp.roles[1], None)
 
-        prompt_input = conv_temp.get_prompt()
-        input_ids = self.tokenizer([prompt_input]).input_ids
-        output_ids = self.model.generate(
-            torch.as_tensor(input_ids).cuda(),
-            do_sample=False,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-            max_new_tokens=max_tokens
-        )
+    def generate_batch(self, prompts, temperature=0, max_tokens=512, n=1, max_trials=10, failure_sleep_time=5):
+        results = []
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = {executor.submit(self.generate, prompt, temperature, max_tokens, n,
+                                       max_trials, failure_sleep_time): prompt for prompt in prompts}
+            for future in concurrent.futures.as_completed(futures):
+                results.extend(future.result())
+        return results
 
-        if self.model.config.is_encoder_decoder:
-            output_ids = output_ids[0]
-        else:
-            output_ids = output_ids[0][len(input_ids[0]):]
+    # @torch.inference_mode()
+    # def generate_batch(self, prompts, temperature=0.01, max_tokens=512, repetition_penalty=1.0, batch_size=16):
+    #     prompt_inputs = []
+    #     for prompt in prompts:
+    #         conv_temp = get_conversation_template(self.model_path)
+    #         self.set_system_message(conv_temp)
 
-        return self.tokenizer.decode(
-            output_ids, skip_special_tokens=True, spaces_between_special_tokens=False
-        )
+    #         conv_temp.append_message(conv_temp.roles[0], prompt)
+    #         conv_temp.append_message(conv_temp.roles[1], None)
 
-    @torch.inference_mode()
-    def generate_batch(self, prompts, temperature=0.01, max_tokens=512, repetition_penalty=1.0, batch_size=16):
-        prompt_inputs = []
-        for prompt in prompts:
-            conv_temp = get_conversation_template(self.model_path)
-            self.set_system_message(conv_temp)
+    #         prompt_input = conv_temp.get_prompt()
+    #         prompt_inputs.append(prompt_input)
 
-            conv_temp.append_message(conv_temp.roles[0], prompt)
-            conv_temp.append_message(conv_temp.roles[1], None)
-
-            prompt_input = conv_temp.get_prompt()
-            prompt_inputs.append(prompt_input)
-
-        if self.tokenizer.pad_token == None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"
-        input_ids = self.tokenizer(prompt_inputs, padding=True).input_ids
-        # load the input_ids batch by batch to avoid OOM
-        outputs = []
-        for i in range(0, len(input_ids), batch_size):
-            output_ids = self.model.generate(
-                torch.as_tensor(input_ids[i:i+batch_size]).cuda(),
-                do_sample=False,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-                max_new_tokens=max_tokens,
-            )
-            output_ids = output_ids[:, len(input_ids[0]):]
-            outputs.extend(self.tokenizer.batch_decode(
-                output_ids, skip_special_tokens=True, spaces_between_special_tokens=False))
-        return outputs
+    #     if self.tokenizer.pad_token == None:
+    #         self.tokenizer.pad_token = self.tokenizer.eos_token
+    #     self.tokenizer.padding_side = "left"
+    #     input_ids = self.tokenizer(prompt_inputs, padding=True).input_ids
+    #     # load the input_ids batch by batch to avoid OOM
+    #     outputs = []
+    #     for i in range(0, len(input_ids), batch_size):
+    #         output_ids = self.model.generate(
+    #             torch.as_tensor(input_ids[i:i+batch_size]).cuda(),
+    #             do_sample=False,
+    #             temperature=temperature,
+    #             repetition_penalty=repetition_penalty,
+    #             max_new_tokens=max_tokens,
+    #         )
+    #         output_ids = output_ids[:, len(input_ids[0]):]
+    #         outputs.extend(self.tokenizer.batch_decode(
+    #             output_ids, skip_special_tokens=True, spaces_between_special_tokens=False))
+    #     return outputs
 
 
 class LocalVLLM(LLM):
